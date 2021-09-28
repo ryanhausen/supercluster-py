@@ -16,7 +16,8 @@
 # LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
 # OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 # PERFORMANCE OF THIS SOFTWARE.
-from typing import Callable
+import math
+from typing import Callable, Tuple
 import numpy as np
 from kdbush import KDBush
 
@@ -34,6 +35,7 @@ class Supercluster:
         generate_id: bool = False,  # whether to generate numeric ids for input features
         reduce_f: Callable = None,  # a reduce function for calculating custom cluster properties
         map: Callable = lambda i: i,  # properties to use for individual points when running the `reduce_f`
+        alternate_CRS: Tuple[int,int] = () # if using a simple CRS set the tuple to [max_y, max_x]
     ):
         self.min_zoom = min_zoom
         self.max_zoom = max_zoom
@@ -45,7 +47,8 @@ class Supercluster:
         self.generate_id = generate_id
         self.reduce_f = reduce_f
         self.map = map
-        self.trees = np.zeros([max_zoom], dtype=object)
+        self.trees = np.zeros([max_zoom+4], dtype=object)
+        self.alternate_CRS = alternate_CRS
 
     # https://github.com/mapbox/supercluster/blob/60d13df9c7d96e9ad16b43c8aca897b5aea38ac9/index.js#L31
     def load(self, points) -> "Supercluster":
@@ -57,11 +60,15 @@ class Supercluster:
 
         clusters = []
         for i in range(len(points)):
-            if "geometry" in points[i]:
-                clusters.append(self.createPointCluster(points[i], i))
+            if points[i].get("geometry", []):
+                clusters.append(self.create_point_cluster(points[i], i))
 
-        self.trees[self.max_zoom + 1] = KDBush(
-            points=clusters, node_size=self.node_size, array_dtype=np.float32,
+        self.trees[self.max_zoom+1] = KDBush(
+            points=clusters,
+            node_size=self.node_size,
+            array_dtype=np.float32,
+            get_x=lambda p: p["x"],
+            get_y=lambda p: p["y"],
         )
 
         if self.log:
@@ -73,7 +80,11 @@ class Supercluster:
 
             clusters = self._cluster(clusters, z)
             self.trees[z] = KDBush(
-                points=clusters, node_size=self.node_size, array_type=np.float32
+                points=clusters,
+                node_size=self.node_size,
+                array_dtype=np.float32,
+                get_x=lambda p: p["x"],
+                get_y=lambda p: p["y"],
             )
 
             if self.log:
@@ -87,15 +98,38 @@ class Supercluster:
     # https://github.com/ryanhausen/supercluster/blob/97dbc5687fe0c6c3e63bafc15ad3d942bbd316b6/index.js#L77
     def get_clusters(self, bbox, zoom):
 
+        if self.alternate_CRS:
+            min_lng, min_lat, max_lng, max_lat = bbox
+        else:
+            min_lng = ((bbox[0] + 180) % 360 + 360) % 360 - 180
+            min_lat = math.max(-90, math.min(90, bbox[1]))
+            max_lng = 180 if bbox[2] == 180 else ((bbox[2] + 180) % 360 + 360) % 360 - 180
+            max_lat = math.max(-90, math.min(90, bbox[3]))
+
+            if (bbox[2] - bbox[0] >= 360):
+                min_lng = -180
+                max_lng = 180
+            elif min_lng > max_lng:
+                easternHem = self.getClusters([min_lng, min_lat, 180, max_lat], zoom)
+                westernHem = self.getClusters([-180, min_lat, max_lng, max_lat], zoom)
+                return easternHem + westernHem
+
         tree = self.trees[self._limit_zoom(zoom)]
 
-        min_lng, min_lat, max_lng, max_lat = bbox
-        ids = tree.range(
-            self.lng_x(min_lng),
-            self.lat_y(min_lat),
-            self.lng_x(max_lng),
-            self.lat_y(max_lat),
-        )
+        if self.alternate_CRS:
+            ids = tree.range(
+                self.lng_x(min_lng),
+                self.lat_y(min_lat),
+                self.lng_x(max_lng),
+                self.lat_y(max_lat),
+            )
+        else:
+            ids = tree.range(
+                self.lng_x(min_lng),
+                self.lat_y(max_lat),
+                self.lng_x(max_lng),
+                self.lat_y(min_lat),
+            )
 
         clusters = []
         for id in ids:
@@ -216,15 +250,15 @@ class Supercluster:
 
         for i in ids:
             c = points[i]
-            is_cluster = c["num_points"]
+            is_cluster = "num_points" in c
 
             if is_cluster:
                 tags = self.get_cluster_properties(c)
                 px = c["x"]
                 py = c["y"]
             else:
-                p = self.points[c.index]
-                tags = p.properties
+                p = self.points[c["index"]]
+                tags = p["properties"]
                 px = self.lng_x(p["geometry"]["coordinates"][0])
                 py = self.lng_x(p["geometry"]["coordinates"][1])
 
@@ -236,15 +270,17 @@ class Supercluster:
                         round(self.extent * (py * z2 - y)),
                     ]
                 ],
-                **tags
+                **tags,
             )
 
             if is_cluster:
                 id = c["id"]
             elif self.generate_id:
                 id = c["index"]
-            elif self.points[c["index"]]["id"]:
+            elif "id" in self.points[c["index"]]:
                 id = self.points[c["index"]]["id"]
+            else:
+                id = None
 
             if id is not None:
                 f["id"] = id
@@ -270,15 +306,15 @@ class Supercluster:
             p["zoom"] = zoom
 
             tree = self.trees[zoom + 1]
-            neighbor_ids = tree.within(p.x, p.y, r)
+            neighbor_ids = tree.within(p["x"], p["y"], r)
 
-            num_points_origin = max(p.numPoints, 1)
+            num_points_origin = p.get("num_points", 1)
             num_points = num_points_origin
 
             for neighbor_id in neighbor_ids:
                 b = tree.points[neighbor_id]
                 if b["zoom"] > zoom:
-                    num_points += max(b["num_points"], 1)
+                    num_points += b.get("num_points", 1)
 
             if num_points >= self.min_points:
                 wx = p["x"] * num_points_origin
@@ -299,9 +335,9 @@ class Supercluster:
                         continue
                     b["zoom"] = zoom
 
-                    num_points_2 = max(b["num_points"], 1)
-                    wx = b["x"] * num_points_origin
-                    wy = b["y"] * num_points_origin
+                    num_points_2 = b.get("num_points", 1)
+                    wx = b["x"] * num_points_2
+                    wy = b["y"] * num_points_2
 
                     b["parentId"] = id
 
@@ -322,7 +358,7 @@ class Supercluster:
                 )
 
             else:
-                clusters.push(p)
+                clusters.append(p)
 
                 if num_points > 1:
                     for neighbor_id in neighbor_ids:
@@ -330,6 +366,9 @@ class Supercluster:
                         if b["zoom"] <= zoom:
                             continue
                         clusters.append(b)
+
+        return clusters
+
 
     # get index of the point from which the cluster originated
     # https://github.com/mapbox/supercluster/blob/60d13df9c7d96e9ad16b43c8aca897b5aea38ac9/index.js#L320
@@ -362,31 +401,30 @@ class Supercluster:
         )
 
     # https://github.com/mapbox/supercluster/blob/60d13df9c7d96e9ad16b43c8aca897b5aea38ac9/index.js#L351
-    def createPointCluster(self, p, id):
+    def create_point_cluster(self, p, id):
         x, y = p["geometry"]["coordinates"]
         return dict(
-            x = self.lngX(x), # projected point coordinates
-            y = self.latY(y),
-            zoom = np.inf, # the last zoom the point was processed at
-            index = id, # index of the source feature in the original input array,
-            parentId = -1 # parent cluster id
+            x=self.lng_x(x),  # projected point coordinates
+            y=self.lat_y(y),
+            zoom=np.inf,  # the last zoom the point was processed at
+            index=id,  # index of the source feature in the original input array,
+            parentId=-1,  # parent cluster id
         )
 
     # https://github.com/mapbox/supercluster/blob/60d13df9c7d96e9ad16b43c8aca897b5aea38ac9/index.js#L362
-    def getClusterJSON(self, cluster):
+    def get_cluster_JSON(self, cluster):
         return dict(
-            type = 'Feature',
-            id = cluster["id"],
-            properties = self.getClusterProperties(cluster),
-            geometry = dict(
-                type = 'Point',
-                coordinates = [self.xLng(cluster["x"]), self.yLat(cluster["y"])]
+            type="Feature",
+            id=cluster["id"],
+            properties=self.getClusterProperties(cluster),
+            geometry=dict(
+                type="Point",
+                coordinates=[self.x_lng(cluster["x"]), self.y_lat(cluster["y"])],
             ),
         )
 
-
-    def getClusterProperties(self, cluster):
-        count = cluster["numPoints"]
+    def get_cluster_properties(self, cluster):
+        count = cluster["num_points"]
 
         if count >= 10000:
             abbrev = f"{round(count) / 1000}k"
@@ -395,24 +433,43 @@ class Supercluster:
         else:
             abbrev = count
 
+        props = cluster["properties"] if cluster["properties"] else {}
         return dict(
             cluster=True,
             cluster_id=cluster["id"],
             point_count=count,
             point_count_abbreviate=abbrev,
-            **cluster["properties"]
+            **props,
         )
 
-    def lngX(self, lng):
-        return lng
 
-    def latY(self, lat):
-        return lat
+    # needs to bound lng to [0..1]
+    def lng_x(self, lng):
+        if self.alternate_CRS:
+            return lng / self.alternate_CRS[1]
+        else:
+            return lng / 360 + 0.5
 
+    # needs to bound lat to [0..1]
+    def lat_y(self, lat):
+        if self.alternate_CRS:
+            return lat / self.alternate_CRS[0]
+        else:
+            sin = math.sin(lat * math.pi / 180)
+            y = (0.5 - 0.25 * math.log((1 + sin) / (1 - sin)) / math.pi)
+            return min(max(y, 0), 1)
 
-    def xLng(self, x):
-        return x
+    # return to original coordinate system
+    def x_lng(self, x):
+        if self.alternate_CRS:
+            return x * self.alternate_CRS[1]
+        else:
+            return (x - 0.5) * 360
 
-
-    def yLat(self, y):
-        return ys
+    # return to original coordinate system
+    def y_lat(self, y):
+        if self.alternate_CRS:
+            return y * self.alternate_CRS[1]
+        else:
+            y2 = (180 - y * 360) * math.pi / 180
+            return 360 * math.atan(math.exp(y2)) / math.pi - 90
